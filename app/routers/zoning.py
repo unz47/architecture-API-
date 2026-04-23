@@ -27,7 +27,7 @@ def latlng_to_tile(lat: float, lng: float, zoom: int) -> tuple[int, int]:
 
 def find_feature_at_point(geojson: dict, lat: float, lng: float) -> dict | None:
     """GeoJSONから指定座標を含むポリゴンのFeatureを返す"""
-    point = Point(lng, lat)  # GeoJSONは(lng, lat)の順
+    point = Point(lng, lat)
     for feature in geojson.get("features", []):
         try:
             geom = shape(feature["geometry"])
@@ -36,6 +36,30 @@ def find_feature_at_point(geojson: dict, lat: float, lng: float) -> dict | None:
         except Exception:
             continue
     return None
+
+
+def find_all_features_at_point(geojson: dict, lat: float, lng: float) -> list[dict]:
+    """GeoJSONから指定座標を含む全てのFeatureを返す"""
+    point = Point(lng, lat)
+    results = []
+    for feature in geojson.get("features", []):
+        try:
+            geom = shape(feature["geometry"])
+            if geom.contains(point):
+                results.append(feature)
+        except Exception:
+            continue
+    return results
+
+
+async def fetch_tile(client: httpx.AsyncClient, endpoint: str, z: int, x: int, y: int) -> httpx.Response:
+    """不動産情報ライブラリAPIからGeoJSONタイルを取得する"""
+    return await client.get(
+        f"{BASE_URL}/{endpoint}",
+        params={"response_format": "geojson", "z": z, "x": x, "y": y},
+        headers=HEADERS,
+        timeout=30,
+    )
 
 
 @router.get("/v1/zoning")
@@ -51,24 +75,28 @@ async def get_zoning(
     x, y = latlng_to_tile(lat, lng, ZOOM)
 
     async with httpx.AsyncClient() as client:
-        zoning_resp, fire_resp = await asyncio.gather(
-            client.get(
-                f"{BASE_URL}/XKT002",
-                params={"response_format": "geojson", "z": ZOOM, "x": x, "y": y},
-                headers=HEADERS,
-                timeout=30,
-            ),
-            client.get(
-                f"{BASE_URL}/XKT014",
-                params={"response_format": "geojson", "z": ZOOM, "x": x, "y": y},
-                headers=HEADERS,
-                timeout=30,
-            ),
+        responses = await asyncio.gather(
+            fetch_tile(client, "XKT001", ZOOM, x, y),  # 都市計画区域
+            fetch_tile(client, "XKT002", ZOOM, x, y),  # 用途地域
+            fetch_tile(client, "XKT014", ZOOM, x, y),  # 防火地域
+            fetch_tile(client, "XKT023", ZOOM, x, y),  # 地区計画
+            fetch_tile(client, "XKT024", ZOOM, x, y),  # 高度利用地区
+            fetch_tile(client, "XKT026", ZOOM, x, y),  # 洪水浸水想定区域
+            fetch_tile(client, "XKT029", ZOOM, x, y),  # 土砂災害警戒区域
         )
+        area_resp, zoning_resp, fire_resp, district_resp, height_resp, flood_resp, landslide_resp = responses
 
     result = {"lat": lat, "lng": lng}
 
-    # 用途地域
+    # 都市計画区域（XKT001）
+    if area_resp.status_code == 200:
+        feature = find_feature_at_point(area_resp.json(), lat, lng)
+        if feature:
+            props = feature.get("properties", {})
+            result["都市計画区域"] = props.get("city_plan_area_ja", "")
+            result["区域区分"] = props.get("area_class_ja", "")
+
+    # 用途地域（XKT002）
     if zoning_resp.status_code == 200:
         feature = find_feature_at_point(zoning_resp.json(), lat, lng)
         if feature:
@@ -79,12 +107,50 @@ async def get_zoning(
             result["市区町村"] = props.get("city_name", "")
             result["都道府県"] = props.get("prefecture", "")
 
-    # 防火地域
+    # 防火地域（XKT014）
     if fire_resp.status_code == 200:
         feature = find_feature_at_point(fire_resp.json(), lat, lng)
         if feature:
             props = feature.get("properties", {})
             result["防火地域"] = props.get("fire_prevention_ja", "")
+
+    # 地区計画（XKT023）
+    if district_resp.status_code == 200:
+        feature = find_feature_at_point(district_resp.json(), lat, lng)
+        if feature:
+            props = feature.get("properties", {})
+            result["地区計画"] = props.get("district_plan_ja", props.get("name", ""))
+
+    # 高度利用地区（XKT024）
+    if height_resp.status_code == 200:
+        feature = find_feature_at_point(height_resp.json(), lat, lng)
+        if feature:
+            props = feature.get("properties", {})
+            result["高度利用地区"] = props.get("high_use_district_ja", props.get("name", ""))
+
+    # 洪水浸水想定区域（XKT026）
+    if flood_resp.status_code == 200:
+        features = find_all_features_at_point(flood_resp.json(), lat, lng)
+        if features:
+            result["洪水浸水想定"] = [
+                {
+                    "浸水深": f.get("properties", {}).get("depth_ja", ""),
+                    "河川名": f.get("properties", {}).get("river_name_ja", ""),
+                }
+                for f in features
+            ]
+
+    # 土砂災害警戒区域（XKT029）
+    if landslide_resp.status_code == 200:
+        features = find_all_features_at_point(landslide_resp.json(), lat, lng)
+        if features:
+            result["土砂災害警戒区域"] = [
+                {
+                    "区域区分": f.get("properties", {}).get("sediment_disaster_ja", ""),
+                    "現象の種類": f.get("properties", {}).get("phenomenon_ja", ""),
+                }
+                for f in features
+            ]
 
     if "用途地域" not in result:
         result["用途地域"] = None
