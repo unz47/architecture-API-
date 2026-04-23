@@ -53,7 +53,6 @@ def find_all_features_at_point(geojson: dict, lat: float, lng: float) -> list[di
 
 
 async def fetch_tile(client: httpx.AsyncClient, endpoint: str, z: int, x: int, y: int) -> httpx.Response:
-    """不動産情報ライブラリAPIからGeoJSONタイルを取得する"""
     return await client.get(
         f"{BASE_URL}/{endpoint}",
         params={"response_format": "geojson", "z": z, "x": x, "y": y},
@@ -67,7 +66,7 @@ async def get_zoning(
     lat: float = Query(..., description="緯度", example=35.6812),
     lng: float = Query(..., description="経度", example=139.7671),
 ):
-    """緯度経度から用途地域・建蔽率・容積率・防火地域を返す"""
+    """緯度経度から建築規制情報・防災情報を一括取得する"""
 
     if not REINFOLIB_API_KEY:
         raise HTTPException(status_code=500, detail="REINFOLIB_API_KEY not configured")
@@ -93,8 +92,7 @@ async def get_zoning(
         feature = find_feature_at_point(area_resp.json(), lat, lng)
         if feature:
             props = feature.get("properties", {})
-            result["都市計画区域"] = props.get("city_plan_area_ja", "")
-            result["区域区分"] = props.get("area_class_ja", "")
+            result["都市計画区域"] = props.get("area_classification_ja", "")
 
     # 用途地域（XKT002）
     if zoning_resp.status_code == 200:
@@ -119,14 +117,14 @@ async def get_zoning(
         feature = find_feature_at_point(district_resp.json(), lat, lng)
         if feature:
             props = feature.get("properties", {})
-            result["地区計画"] = props.get("district_plan_ja", props.get("name", ""))
+            result["地区計画"] = props.get("plan_name", "")
 
     # 高度利用地区（XKT024）
     if height_resp.status_code == 200:
         feature = find_feature_at_point(height_resp.json(), lat, lng)
         if feature:
             props = feature.get("properties", {})
-            result["高度利用地区"] = props.get("high_use_district_ja", props.get("name", ""))
+            result["高度利用地区"] = props.get("plan_name", props.get("name", ""))
 
     # 洪水浸水想定区域（XKT026）
     if flood_resp.status_code == 200:
@@ -134,8 +132,8 @@ async def get_zoning(
         if features:
             result["洪水浸水想定"] = [
                 {
-                    "浸水深": f.get("properties", {}).get("depth_ja", ""),
-                    "河川名": f.get("properties", {}).get("river_name_ja", ""),
+                    "浸水深": f.get("properties", {}).get("A31a_205", ""),
+                    "河川名": f.get("properties", {}).get("A31a_202", ""),
                 }
                 for f in features
             ]
@@ -145,10 +143,7 @@ async def get_zoning(
         features = find_all_features_at_point(landslide_resp.json(), lat, lng)
         if features:
             result["土砂災害警戒区域"] = [
-                {
-                    "区域区分": f.get("properties", {}).get("sediment_disaster_ja", ""),
-                    "現象の種類": f.get("properties", {}).get("phenomenon_ja", ""),
-                }
+                f.get("properties", {})
                 for f in features
             ]
 
