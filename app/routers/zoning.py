@@ -1,5 +1,6 @@
 import asyncio
 import math
+import re
 
 import httpx
 from fastapi import APIRouter, Query, HTTPException
@@ -94,6 +95,254 @@ def safe_json(resp: httpx.Response) -> dict | None:
     return None
 
 
+def parse_percent(value: str | None) -> float | None:
+    """'80%' のような文字列からfloatを取り出す"""
+    if not value:
+        return None
+    m = re.search(r"([\d.]+)", str(value))
+    return float(m.group(1)) if m else None
+
+
+# ── 計算ロジック ──────────────────────────────────
+
+
+def calc_disaster_risk_score(result: dict) -> dict:
+    """防災データから災害リスクスコア(0-100)を算出する"""
+    score = 0
+    details = []
+
+    # 洪水浸水（最大30点）
+    flood = result.get("洪水浸水想定")
+    if flood:
+        max_depth = 0
+        for f in flood:
+            depth = f.get("浸水深")
+            if isinstance(depth, (int, float)):
+                max_depth = max(max_depth, depth)
+        if max_depth >= 5:
+            pts = 30
+        elif max_depth >= 3:
+            pts = 25
+        elif max_depth >= 1:
+            pts = 20
+        elif max_depth >= 0.5:
+            pts = 10
+        else:
+            pts = 5
+        score += pts
+        details.append(f"洪水浸水(浸水深{max_depth}): +{pts}")
+
+    # 津波（最大25点）
+    if result.get("津波浸水想定"):
+        score += 25
+        details.append("津波浸水想定区域内: +25")
+
+    # 土砂災害（最大20点）
+    sediment = result.get("土砂災害警戒区域")
+    if sediment:
+        score += 20
+        details.append("土砂災害警戒区域内: +20")
+
+    # 液状化（最大15点）
+    liq = result.get("液状化")
+    if liq:
+        level = liq.get("liquefaction_tendency_level")
+        if level == 1:
+            pts = 15
+        elif level == 2:
+            pts = 10
+        elif level == 3:
+            pts = 5
+        else:
+            pts = 0
+        if pts > 0:
+            score += pts
+            note = liq.get("note", "")
+            details.append(f"液状化({note}): +{pts}")
+
+    # 高潮（最大10点）
+    if result.get("高潮浸水想定"):
+        score += 10
+        details.append("高潮浸水想定区域内: +10")
+
+    # 災害危険区域（+10点）
+    if result.get("災害危険区域"):
+        score += 10
+        details.append("災害危険区域内: +10")
+
+    # 地すべり防止地区（+10点）
+    if result.get("地すべり防止地区"):
+        score += 10
+        details.append("地すべり防止地区内: +10")
+
+    # 急傾斜地崩壊危険区域（+10点）
+    if result.get("急傾斜地崩壊危険区域"):
+        score += 10
+        details.append("急傾斜地崩壊危険区域内: +10")
+
+    score = min(score, 100)
+
+    if score == 0:
+        level = "低"
+    elif score <= 20:
+        level = "やや低"
+    elif score <= 40:
+        level = "中"
+    elif score <= 60:
+        level = "やや高"
+    elif score <= 80:
+        level = "高"
+    else:
+        level = "非常に高"
+
+    return {
+        "スコア": score,
+        "リスクレベル": level,
+        "内訳": details,
+    }
+
+
+def calc_building_volume(result: dict, site_area: float) -> dict | None:
+    """用途地域+建蔽率+容積率から建築可能ボリュームを概算する"""
+    bcr = parse_percent(result.get("建蔽率"))
+    far = parse_percent(result.get("容積率"))
+
+    if bcr is None or far is None:
+        return None
+
+    building_area = site_area * bcr / 100
+    total_floor = site_area * far / 100
+    max_floors = int(total_floor / building_area) if building_area > 0 else 0
+
+    return {
+        "敷地面積_m2": site_area,
+        "建蔽率": f"{bcr}%",
+        "容積率": f"{far}%",
+        "建築面積_m2": round(building_area, 2),
+        "最大延床面積_m2": round(total_floor, 2),
+        "想定階数": max_floors,
+        "注記": "斜線制限・高さ制限・日影規制は未考慮の概算値です",
+    }
+
+
+def calc_area_future_score(result: dict) -> dict | None:
+    """将来推計人口から20年後のエリア将来性を算出する"""
+    pop = result.get("将来推計人口")
+    if not pop:
+        return None
+
+    # PTN_YYYY = 総人口推計（250mメッシュ内の人数）
+    current = pop.get("PTN_2025") or pop.get("PTN_2020")
+    future_20y = pop.get("PTN_2045")
+    future_30y = pop.get("PTN_2050")
+
+    if current is None or current == 0:
+        return None
+
+    result_data = {"現在推計人口": round(current, 1)}
+
+    if future_20y is not None:
+        change_20 = (future_20y - current) / current * 100
+        result_data["20年後推計人口"] = round(future_20y, 1)
+        result_data["20年後増減率"] = f"{change_20:+.1f}%"
+
+    if future_30y is not None:
+        change_30 = (future_30y - current) / current * 100
+        result_data["25年後推計人口"] = round(future_30y, 1)
+        result_data["25年後増減率"] = f"{change_30:+.1f}%"
+
+    # スコアリング: 人口増加→高スコア、減少→低スコア
+    if future_20y is not None:
+        change = (future_20y - current) / current * 100
+        if change >= 10:
+            score, level = 90, "非常に高い"
+        elif change >= 0:
+            score, level = 70, "高い"
+        elif change >= -10:
+            score, level = 50, "普通"
+        elif change >= -20:
+            score, level = 30, "やや低い"
+        else:
+            score, level = 10, "低い"
+        result_data["将来性スコア"] = score
+        result_data["評価"] = level
+
+    return result_data
+
+
+def build_regulation_summary(result: dict) -> str:
+    """法規情報を自然言語で1段落にまとめる"""
+    parts = []
+
+    # 所在
+    pref = result.get("都道府県", "")
+    city = result.get("市区町村", "")
+    if pref and city:
+        parts.append(f"所在地は{pref}{city}")
+
+    # 都市計画
+    area = result.get("都市計画区域")
+    if area:
+        parts.append(f"{area}内")
+
+    # 用途地域
+    zone = result.get("用途地域")
+    if zone:
+        bcr = result.get("建蔽率", "")
+        far = result.get("容積率", "")
+        parts.append(f"用途地域は{zone}（建蔽率{bcr}・容積率{far}）")
+
+    # 防火
+    fire = result.get("防火地域")
+    if fire:
+        parts.append(f"{fire}に指定")
+
+    # 地区計画
+    dp = result.get("地区計画")
+    if dp:
+        parts.append(f"地区計画「{dp}」の区域内")
+
+    # 都市計画道路
+    if result.get("都市計画道路"):
+        parts.append("都市計画道路がかかる可能性あり")
+
+    # 立地適正化
+    if result.get("立地適正化計画"):
+        parts.append("立地適正化計画の区域内")
+
+    # 災害リスク
+    risks = []
+    if result.get("洪水浸水想定"):
+        rivers = [f.get("河川名", "") for f in result["洪水浸水想定"] if f.get("河川名")]
+        if rivers:
+            risks.append(f"洪水浸水想定（{', '.join(rivers)}）")
+        else:
+            risks.append("洪水浸水想定区域")
+    if result.get("津波浸水想定"):
+        risks.append("津波浸水想定区域")
+    if result.get("高潮浸水想定"):
+        risks.append("高潮浸水想定区域")
+    if result.get("土砂災害警戒区域"):
+        risks.append("土砂災害警戒区域")
+    if result.get("地すべり防止地区"):
+        risks.append("地すべり防止地区")
+    if result.get("急傾斜地崩壊危険区域"):
+        risks.append("急傾斜地崩壊危険区域")
+
+    liq = result.get("液状化")
+    if liq:
+        note = liq.get("note", "")
+        if note:
+            risks.append(f"液状化（{note}）")
+
+    if risks:
+        parts.append("災害リスクとして" + "・".join(risks) + "に該当")
+    else:
+        parts.append("主要な災害リスク区域には非該当")
+
+    return "。".join(parts) + "。"
+
+
 # ── エンドポイント ──────────────────────────────────
 
 
@@ -101,6 +350,9 @@ def safe_json(resp: httpx.Response) -> dict | None:
 async def get_zoning(
     lat: float = Query(..., description="緯度", example=35.6812),
     lng: float = Query(..., description="経度", example=139.7671),
+    site_area: float | None = Query(
+        None, description="敷地面積（m2）。指定すると建築可能ボリュームを概算", example=200
+    ),
 ):
     """緯度経度から建築規制情報・防災情報・マーケット情報を一括取得する"""
 
@@ -128,10 +380,13 @@ async def get_zoning(
             fetch_tile(client, "XKT027", ZOOM, x, y),  # 12: 高潮浸水想定区域
             fetch_tile(client, "XKT028", ZOOM, x, y),  # 13: 津波浸水想定
             fetch_tile(client, "XKT029", ZOOM, x, y),  # 14: 土砂災害警戒区域
-            # ── その他 ──
+            # ── 周辺・マーケット ──
             fetch_tile(client, "XGT001", ZOOM, x, y),  # 15: 指定緊急避難場所
             fetch_tile(client, "XPT002", ZOOM, x, y),  # 16: 地価公示・地価調査
             fetch_tile(client, "XKT013", ZOOM, x, y),  # 17: 将来推計人口
+            fetch_tile(client, "XKT004", ZOOM, x, y),  # 18: 小学校区
+            fetch_tile(client, "XKT015", ZOOM, x, y),  # 19: 駅別乗降客数
+            fetch_tile(client, "XKT031", ZOOM, x, y),  # 20: 人口集中地区
         )
 
     result = {"lat": lat, "lng": lng}
@@ -276,7 +531,7 @@ async def get_zoning(
                 f.get("properties", {}) for f in features
             ]
 
-    # ━━ その他（周辺情報・マーケット） ━━━━━━━━━━━━━━━━━━
+    # ━━ 周辺情報・マーケット ━━━━━━━━━━━━━━━━━━━━━━━━━
 
     # 指定緊急避難場所（XGT001）- ポイントデータなので近傍検索
     data = safe_json(responses[15])
@@ -302,6 +557,48 @@ async def get_zoning(
         feature = find_feature_at_point(data, lat, lng)
         if feature:
             result["将来推計人口"] = feature.get("properties", {})
+
+    # 小学校区（XKT004）
+    data = safe_json(responses[18])
+    if data:
+        feature = find_feature_at_point(data, lat, lng)
+        if feature:
+            result["小学校区"] = feature.get("properties", {})
+
+    # 駅別乗降客数（XKT015）- ポイントデータなので近傍検索
+    data = safe_json(responses[19])
+    if data:
+        nearby = find_nearby_features(data, lat, lng, limit=3)
+        if nearby:
+            result["最寄り駅"] = [
+                f.get("properties", {}) for f in nearby
+            ]
+
+    # 人口集中地区（XKT031）
+    data = safe_json(responses[20])
+    if data:
+        feature = find_feature_at_point(data, lat, lng)
+        if feature:
+            result["人口集中地区"] = feature.get("properties", {})
+
+    # ━━ 計算ロジック（付加価値） ━━━━━━━━━━━━━━━━━━━━━━
+
+    # 災害リスクスコア
+    result["災害リスクスコア"] = calc_disaster_risk_score(result)
+
+    # 建築可能ボリューム概算（敷地面積が指定された場合のみ）
+    if site_area is not None and site_area > 0:
+        volume = calc_building_volume(result, site_area)
+        if volume:
+            result["建築可能ボリューム概算"] = volume
+
+    # エリア将来性
+    future = calc_area_future_score(result)
+    if future:
+        result["エリア将来性"] = future
+
+    # 法規サマリー
+    result["法規サマリー"] = build_regulation_summary(result)
 
     # ━━ フォールバック ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
